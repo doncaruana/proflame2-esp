@@ -2,6 +2,7 @@
 #include "proflame2_entities.h"
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
+#include <cstring>
 
 #ifdef USE_ESP_IDF
 #include "freertos/FreeRTOS.h"
@@ -17,8 +18,7 @@ namespace proflame2 {
 static const char *TAG = "proflame2";
 
 // CRC-32/ISO-HDLC (IEEE 802.3, polynomial 0xEDB88320). Bitwise / no table:
-// runs at most twice across the device's lifetime (boot load, learn confirm),
-// so flash-size footprint matters more than throughput.
+// used only for pairing-state load/save, so footprint matters more than throughput.
 uint32_t ProFlame2Component::crc32_iso_(const uint8_t *data, size_t len) {
   uint32_t crc = 0xFFFFFFFFu;
   for (size_t i = 0; i < len; i++) {
@@ -130,26 +130,23 @@ void ProFlame2Component::setup() {
   this->load_learned_state_();
   this->publish_diagnostic_sensors_();
 
-  // init state — flame and fan default to max so a "Power ON" out of the
-  // box gives the fireplace a usable burner level + airflow without the
-  // user having to dial them up first. Secondary flame defaults to ON
-  // (mirroring the seed value of remembered_secondary_flame_). Light
-  // stays 0 (it's the kind of thing you opt into per session), and
-  // pilot/aux stay off.
-  this->current_state_ = ProFlame2Command{
-      .pilot_cpi = false,
-      .light_level = 0,
-      .thermostat = false,
-      .power = false,
-      .secondary_flame = true,
-      .fan_level = 6,
-      .aux_power = false,
-      .flame_level = 6};
+  // Load preferences directly: setters would queue RF during boot.
+  this->load_operating_state_();
+  if (this->power_switch_) this->power_switch_->publish_state(false);
+  if (this->pilot_switch_) this->pilot_switch_->publish_state(this->current_state_.pilot_cpi);
+  if (this->aux_switch_) this->aux_switch_->publish_state(this->current_state_.aux_power);
+  if (this->secondary_flame_switch_) this->secondary_flame_switch_->publish_state(false);
+  if (this->thermostat_switch_) this->thermostat_switch_->publish_state(this->current_state_.thermostat);
+  if (this->flame_number_) this->flame_number_->publish_state(this->current_state_.flame_level);
+  if (this->fan_number_) this->fan_number_->publish_state(this->current_state_.fan_level);
 
   ESP_LOGCONFIG(TAG, "ProFlame 2 setup complete");
 }
 
 void ProFlame2Component::loop() {
+  // save() only updates ESPHome's pending preference cache; the preferences
+  // component flushes changed values to flash on its 60-second interval.
+  this->save_operating_state_();
   if (this->send_pending_) {
     const uint32_t now = millis();
 
@@ -748,10 +745,59 @@ void ProFlame2Component::service_tx_() {
   }
 }
 
+ProFlame2OperatingState ProFlame2Component::operating_state_() const {
+  ProFlame2OperatingState state{};
+  state.flame_level = this->current_state_.flame_level;
+  state.fan_level = this->current_state_.fan_level;
+  state.light_level = this->remembered_light_level_;
+  state.secondary_flame = this->remembered_secondary_flame_;
+  state.pilot_cpi = this->current_state_.pilot_cpi;
+  state.aux_power = this->current_state_.aux_power;
+  state.thermostat = this->current_state_.thermostat;
+  return state;
+}
+
+void ProFlame2Component::load_operating_state_() {
+  this->pref_operating_ = global_preferences->make_preference<ProFlame2OperatingState>(
+      fnv1_hash("proflame2_operating_v1"), true);
+  ProFlame2OperatingState state{};
+  if (!this->pref_operating_.load(&state) || state.version != 1 ||
+      state.flame_level > 6 || state.fan_level > 6 || state.light_level > 6 ||
+      state.secondary_flame > 1 || state.pilot_cpi > 1 ||
+      state.aux_power > 1 || state.thermostat > 1) {
+    state = ProFlame2OperatingState{};
+  }
+  this->current_state_ = ProFlame2Command{
+      .pilot_cpi = state.pilot_cpi != 0,
+      .light_level = 0,
+      .thermostat = state.thermostat != 0,
+      .power = false,
+      .secondary_flame = false,
+      .fan_level = state.fan_level,
+      .aux_power = state.aux_power != 0,
+      .flame_level = state.flame_level};
+  this->remembered_light_level_ = state.light_level;
+  this->remembered_secondary_flame_ = state.secondary_flame != 0;
+  this->saved_operating_ = state;
+}
+
+void ProFlame2Component::save_operating_state_() {
+  const auto state = this->operating_state_();
+  if (std::memcmp(&state, &this->saved_operating_, sizeof(state)) != 0 &&
+      this->pref_operating_.save(&state)) {
+    this->saved_operating_ = state;
+  }
+}
+
 void ProFlame2Component::queue_send() { this->send_pending_ = true; }
 
 // Control methods
 void ProFlame2Component::set_power(bool state) {
+  if (state && this->current_state_.power) {
+    // An explicit ON is also a request to resend the complete cached state.
+    this->queue_send();
+    return;
+  }
   if (this->current_state_.power != state) {
     this->current_state_.power = state;
     this->buffer_dirty_ = true;
@@ -763,18 +809,13 @@ void ProFlame2Component::set_power(bool state) {
     if (!state) {
       // Hardware reality: light + secondary flame don't function without
       // the burner running. Mirror that to HA/HomeKit by force-clearing
-      // both whenever we power down. Stash the last *non-zero* light
+      // both whenever we power down. Stash the current light
       // level and the current secondary-flame state so set_power(true)
       // can restore the user's preference instead of dragging them back
       // to 0/OFF.
-      if (this->current_state_.light_level != 0) {
-        this->remembered_light_level_ = this->current_state_.light_level;
-      }
+      this->remembered_light_level_ = this->current_state_.light_level;
       // Secondary flame: stash the user's current preference unconditionally.
-      // Unlike the light (where 0 means "off, no remembered brightness to
-      // preserve"), secondary is a binary preference where OFF is just as
-      // valid a choice as ON — preserving the user's last toggle is the
-      // correct semantic.
+      // OFF is just as valid a preference as ON.
       this->remembered_secondary_flame_ = this->current_state_.secondary_flame;
       this->current_state_.light_level = 0;
       if (this->light_state_ != nullptr) {
@@ -796,7 +837,7 @@ void ProFlame2Component::set_power(bool state) {
         this->secondary_flame_switch_->publish_state(
             this->remembered_secondary_flame_);
       }
-      // Restore the user's last non-zero light level so toggling power
+      // Restore the user's requested light level so toggling power
       // round-trips cleanly. If they never had it on, this is a no-op.
       if (this->remembered_light_level_ != 0 &&
           this->current_state_.light_level == 0) {
@@ -882,6 +923,7 @@ void ProFlame2Component::set_light_level(uint8_t level) {
     }
     return;
   }
+  this->remembered_light_level_ = level;
   if (this->current_state_.light_level != level) {
     this->current_state_.light_level = level;
     this->buffer_dirty_ = true;
@@ -930,6 +972,10 @@ void ProFlame2Light::write_state(light::LightState *state) {
     level = static_cast<uint8_t>(rounded);
   }
 
+  // Startup and forced OFF callbacks must not erase remembered intent.
+  if (this->parent_->current_state_.power) {
+    this->parent_->remembered_light_level_ = level;
+  }
   if (this->parent_->current_state_.light_level != level) {
     // Update hardware state directly without recursing into set_light_level()
     // (which would call back into this LightState and loop). Then queue a
@@ -972,6 +1018,7 @@ void ProFlame2Component::set_secondary_flame(bool state) {
     }
     return;
   }
+  this->remembered_secondary_flame_ = state;
   if (this->current_state_.secondary_flame != state) {
     this->current_state_.secondary_flame = state;
     this->buffer_dirty_ = true;
