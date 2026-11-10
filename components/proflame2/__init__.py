@@ -25,7 +25,7 @@ from esphome.const import (
 from esphome import pins
 
 DEPENDENCIES = ["spi", "switch", "number", "button", "light", "fan", "climate", "sensor"]
-AUTO_LOAD = ["switch", "number", "button", "light", "fan", "climate", "sensor", "binary_sensor", "text_sensor"]
+AUTO_LOAD = ["switch", "number", "button", "light", "fan", "climate", "sensor", "binary_sensor", "text_sensor", "preferences"]
 
 proflame2_ns = cg.esphome_ns.namespace("proflame2")
 ProFlame2Component = proflame2_ns.class_(
