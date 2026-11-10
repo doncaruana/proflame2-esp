@@ -48,6 +48,20 @@ struct ProFlame2Command {
   uint8_t flame_level;   // 0-6
 };
 
+// Explicit byte layout: never persist compiler-dependent bools or struct padding.
+// Power is deliberately absent: every boot starts OFF.
+struct ProFlame2OperatingState {
+  uint8_t version{1};
+  uint8_t flame_level{6};
+  uint8_t fan_level{6};
+  uint8_t light_level{0};
+  uint8_t secondary_flame{1};
+  uint8_t pilot_cpi{0};
+  uint8_t aux_power{0};
+  uint8_t thermostat{0};
+};
+static_assert(sizeof(ProFlame2OperatingState) == 8, "Operating NVS layout changed");
+
 // Persistent state written by the on-device learn-mode pairing flow. When a
 // valid blob is present in NVS, its serial + ECC constants override the
 // YAML-seeded defaults at boot. See README "Pairing your remote".
@@ -265,7 +279,7 @@ class ProFlame2Component : public Component,
   uint8_t read_register(uint8_t reg);
 
   ProFlame2Command current_state_{};
-  // Last non-zero light level seen while power was on, OR a level the
+  // Last requested light level (including OFF), OR a level the
   // user pre-dialed via the UI while power was off. Restored by
   // set_power(true) so toggling the fireplace doesn't lose the user's
   // last brightness preference. Exposed via get_remembered_light_level()
@@ -275,9 +289,9 @@ class ProFlame2Component : public Component,
     return this->remembered_light_level_;
   }
   // Mirror of remembered_light_level_ for the binary secondary-flame
-  // setting. Defaults to true so a fresh boot's first power-on lights
+  // setting. Defaults to true so an unconfigured first power-on lights
   // both burners as before. Updated by set_secondary_flame() while
-  // power is on (when ON) or while power is off (any change), and
+  // power is on or off (including OFF), and
   // applied by set_power(true).
   bool remembered_secondary_flame_{true};
   bool get_remembered_secondary_flame() const {
@@ -288,6 +302,12 @@ class ProFlame2Component : public Component,
   void encode_manchester(uint8_t *input, uint8_t *output, size_t input_len);
 
  protected:
+  void load_operating_state_();
+  void save_operating_state_();
+  ProFlame2OperatingState operating_state_() const;
+  ESPPreferenceObject pref_operating_;
+  ProFlame2OperatingState saved_operating_{};
+
   void reset_cc1101();
   void configure_cc1101();
   // Equivalent to the radio-init sequence in setup(): SRES → configure_cc1101
