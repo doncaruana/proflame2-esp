@@ -32,14 +32,12 @@ void ProFlame2Climate::setup() {
   // users wanting fine control can still drive the existing `fan` number entity.
   // Mapping (also enforced in apply_fan_level_): OFF→0, LOW→2, MEDIUM→4, HIGH→6.
 
-  // Restore mode + target_temperature from RTC if a previous boot had them set.
+  // Restore the target only. Restoring HEAT via perform() can immediately
+  // ignite the fireplace during setup, before any explicit user command.
   auto restore = this->restore_state_();
-  if (restore.has_value()) {
-    restore->to_call(this).perform();
-  } else {
-    this->mode = climate::CLIMATE_MODE_OFF;
-    this->target_temperature = 21.0f;  // ~70°F sensible default
-  }
+  this->target_temperature = restore.has_value() ? restore->target_temperature : 21.0f;
+  this->mode = climate::CLIMATE_MODE_OFF;
+  this->action = climate::CLIMATE_ACTION_OFF;
 
   if (this->sensor_ != nullptr && this->sensor_->has_state()) {
     this->current_temperature = this->sensor_->state;
