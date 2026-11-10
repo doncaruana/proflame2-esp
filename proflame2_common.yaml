@@ -16,6 +16,9 @@
 # climate config — is identical across boards and lives here.
 # =============================================================================
 
+preferences:
+  flash_write_interval: 60s
+
 proflame2:
   id: fireplace
 
